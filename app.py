@@ -29,7 +29,6 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
 
 [data-testid="stHeader"] { background: transparent !important; }
 
-/* Contenedores nativos estilizados: CERO cajas vacías */
 div[data-testid="stVerticalBlockBorderWrapper"] {
     background: linear-gradient(145deg, rgba(10, 16, 26, 0.95) 0%, rgba(5, 8, 14, 0.98) 100%) !important;
     border: 1px solid rgba(0, 240, 255, 0.28) !important;
