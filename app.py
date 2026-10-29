@@ -2,13 +2,13 @@ import streamlit as st
 import paho.mqtt.client as mqtt
 import json
 import time
-import random
-import string
+import threading
 
 st.set_page_config(
     page_title="Control de Actuadores IoT",
     page_icon="⚡",
-    layout="centered"
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
 
 st.markdown("""
@@ -22,15 +22,16 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
 }
 
 [data-testid="stHeader"] { background: transparent !important; }
+[data-testid="stSidebar"] { display: none !important; }
 
 div[data-testid="stVerticalBlockBorderWrapper"] {
-    background: linear-gradient(145deg, rgba(12, 20, 42, 0.95) 0%, rgba(7, 12, 26, 0.98) 100%) !important;
-    border: 1px solid rgba(56, 189, 248, 0.28) !important;
+    background: linear-gradient(145deg, #0d152d 0%, #070d1e 100%) !important;
+    border: 1px solid rgba(56, 189, 248, 0.25) !important;
     border-top: 3px solid #38bdf8 !important;
     border-radius: 10px !important;
     padding: 1.2rem !important;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6) !important;
     margin-bottom: 1.2rem !important;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5) !important;
 }
 
 .actuator-label {
@@ -52,100 +53,94 @@ div.stButton > button {
 </style>
 """, unsafe_allow_html=True)
 
+# ==============================================================================
+# CLASE MONOLÍTICA: CONTROLADOR DE COMANDOS MQTT
+# ==============================================================================
+class IoTActuatorGateway:
+    def __init__(self, broker: str = "broker.mqttdashboard.com", port: int = 1883, device_id: str = "esp32_main"):
+        self.broker = broker
+        self.port = port
+        self.device_id = device_id
+        self.topic_digital = f"devices/{device_id}/cmd/digital"
+        self.topic_analog = f"devices/{device_id}/cmd/analog"
+
+        self._lock = threading.Lock()
+        self.connected = False
+        self.history = []
+
+        self._client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"Client_Actuators_{device_id}"
+        )
+        self._client.on_connect = lambda c, u, f, rc, p=None: setattr(self, 'connected', (rc == 0))
+        self._client.on_disconnect = lambda c, u, f, rc, p=None: setattr(self, 'connected', False)
+        
+        try:
+            self._client.connect(self.broker, self.port, keepalive=30)
+            self._client.loop_start()
+        except Exception:
+            self.connected = False
+
+    def send_digital(self, state: bool) -> bool:
+        cmd_str = "ON" if state else "OFF"
+        payload = json.dumps({"state": cmd_str})
+        info = self._client.publish(self.topic_digital, payload, qos=1)
+        with self._lock:
+            self.history.append(f"{time.strftime('%H:%M:%S')} — ACTUADOR DIGITAL: {cmd_str}")
+        return info.rc == mqtt.MQTT_ERR_SUCCESS
+
+    def send_analog(self, angle: int) -> bool:
+        angle = max(0, min(180, int(angle)))
+        payload = json.dumps({"angle": angle})
+        info = self._client.publish(self.topic_analog, payload, qos=1)
+        with self._lock:
+            self.history.append(f"{time.strftime('%H:%M:%S')} — ACTUADOR ANALÓGICO: {angle}°")
+        return info.rc == mqtt.MQTT_ERR_SUCCESS
+
+@st.cache_resource
+def get_actuator_gateway() -> IoTActuatorGateway:
+    return IoTActuatorGateway()
+
+gateway = get_actuator_gateway()
+
+# Estado local del UI
 if 'led_state' not in st.session_state:
-    st.session_state.led_state = "OFF"
+    st.session_state.led_state = False
 if 'servo_angle' not in st.session_state:
     st.session_state.servo_angle = 0
-if 'cmd_count' not in st.session_state:
-    st.session_state.cmd_count = 0
-if 'log' not in st.session_state:
-    st.session_state.log = []
 
-def get_mqtt_client():
-    cid = f"Actuator_Client_{''.join(random.choices(string.ascii_letters + string.digits, k=6))}"
-    try:
-        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=cid)
-    except Exception:
-        try:
-            return mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=cid)
-        except Exception:
-            return mqtt.Client(client_id=cid)
+st.title("⚡ Control de Actuadores")
+st.caption(f"Dispositivo de destino: `{gateway.device_id}` | Socket persistente")
 
-def publicar_comando(broker, port, topic, payload):
-    try:
-        c = get_mqtt_client()
-        c.connect(broker, port, keepalive=15)
-        c.loop_start()
-        msg_str = json.dumps(payload)
-        info = c.publish(topic, msg_str, qos=1)
-        info.wait_for_publish(timeout=2.5)
-        c.loop_stop()
-        c.disconnect()
-        return True, msg_str
-    except Exception as e:
-        return False, str(e)
-
-with st.sidebar:
-    st.markdown("### Configuración de Enlace")
-    broker = st.text_input("Broker MQTT:", value="broker.mqttdashboard.com")
-    port = st.number_input("Puerto:", value=1883)
-    prefijo = st.text_input("Prefijo de Usuario / Wokwi:", value="lizalda")
-    
-    st.markdown("---")
-    base_s = f"{prefijo.strip() + '/' if prefijo.strip() else ''}cmqtt_s"
-    base_a = f"{prefijo.strip() + '/' if prefijo.strip() else ''}cmqtt_a"
-    topic_digital = st.text_input("Tópico Actuador Digital:", value=base_s)
-    topic_analog = st.text_input("Tópico Actuador Analógico:", value=base_a)
-
-st.title("⚡ Control de Actuadores IoT")
-st.caption("Consola de control remoto para actuadores digitales y servomotores sobre ESP32.")
-
-# ACTUADOR DIGITAL (LED / RELÉ)
+# 1. ACTUADOR DIGITAL
 with st.container(border=True):
-    color_led = "#2dd4bf" if st.session_state.led_state == "ON" else "#94a3b8"
-    st.markdown(f'<div class="actuator-label">Actuador Digital (LED / Relé): <span style="color:{color_led}; font-weight:700;">{st.session_state.led_state}</span></div>', unsafe_allow_html=True)
+    color_led = "#2dd4bf" if st.session_state.led_state else "#94a3b8"
+    str_led = "ACTIVADO [ON]" if st.session_state.led_state else "DESACTIVADO [OFF]"
+    st.markdown(f'<div class="actuator-label">Canal Digital (LED / Relé): <span style="color:{color_led};">{str_led}</span></div>', unsafe_allow_html=True)
     
     c_on, c_off = st.columns(2)
     with c_on:
         if st.button("Activar [ON]", use_container_width=True):
-            ok, resp = publicar_comando(broker, int(port), topic_digital, {"Act1": "ON"})
-            if ok:
-                st.session_state.led_state = "ON"
-                st.session_state.cmd_count += 1
-                st.session_state.log.append(f"{time.strftime('%H:%M:%S')} — LED -> ON")
+            if gateway.send_digital(True):
+                st.session_state.led_state = True
                 st.rerun()
-            else:
-                st.error(f"Error de transmisión: {resp}")
     with c_off:
         if st.button("Desactivar [OFF]", use_container_width=True):
-            ok, resp = publicar_comando(broker, int(port), topic_digital, {"Act1": "OFF"})
-            if ok:
-                st.session_state.led_state = "OFF"
-                st.session_state.cmd_count += 1
-                st.session_state.log.append(f"{time.strftime('%H:%M:%S')} — LED -> OFF")
+            if gateway.send_digital(False):
+                st.session_state.led_state = False
                 st.rerun()
-            else:
-                st.error(f"Error de transmisión: {resp}")
 
-# ACTUADOR ANALÓGICO (SERVOMOTOR)
+# 2. ACTUADOR ANALÓGICO
 with st.container(border=True):
-    st.markdown('<div class="actuator-label">Actuador Analógico (Servomotor)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="actuator-label">Canal Analógico (Servomotor)</div>', unsafe_allow_html=True)
     
-    val_slider = st.slider("Magnitud de Apertura (0% a 100%):", 0.0, 100.0, float(st.session_state.servo_angle / 1.8), step=1.0)
-    angulo = int(val_slider * 1.8)
-    st.caption(f"Posición angular equivalente: **{angulo}°** (Rango operativo: 0° a 180°)")
+    val_deg = st.slider("Posición Angular (0° a 180°):", 0, 180, st.session_state.servo_angle, step=5)
     
-    if st.button("Transmitir posición angular", use_container_width=True):
-        ok, resp = publicar_comando(broker, int(port), topic_analog, {"Analog": float(val_slider)})
-        if ok:
-            st.session_state.servo_angle = angulo
-            st.session_state.cmd_count += 1
-            st.session_state.log.append(f"{time.strftime('%H:%M:%S')} — SERVO -> {val_slider:.1f}% ({angulo}°)")
-            st.success(f"Posición de {angulo}° enviada correctamente al microcontrolador.")
-        else:
-            st.error(f"Falla de transmisión: {resp}")
+    if st.button("Transmitir Calibración Angular", use_container_width=True):
+        if gateway.send_analog(val_deg):
+            st.session_state.servo_angle = val_deg
+            st.success(f"Comando de posición ({val_deg}°) despachado al dispositivo.")
 
-with st.expander("Registro de comandos transmitidos", expanded=False):
-    st.write(f"Total órdenes emitidas en la sesión: **{st.session_state.cmd_count}**")
-    for item in reversed(st.session_state.log[-6:]):
-        st.text(item)
+with st.expander("Registro de Órdenes Despachadas", expanded=False):
+    for entry in reversed(gateway.history[-8:]):
+        st.text(entry)
