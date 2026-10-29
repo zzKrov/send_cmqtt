@@ -2,6 +2,7 @@ import streamlit as st
 import paho.mqtt.client as mqtt
 import json
 import time
+import random
 import threading
 
 st.set_page_config(
@@ -54,7 +55,17 @@ div.stButton > button {
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# CLASE MONOLÍTICA: CONTROLADOR DE COMANDOS MQTT
+# FÁBRICA DE CLIENTE MQTT UNIVERSAL
+# ==============================================================================
+def create_mqtt_client(client_prefix: str) -> mqtt.Client:
+    cid = f"{client_prefix}_{int(time.time())}_{random.randint(1000, 9999)}"
+    try:
+        return mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id=cid)
+    except (AttributeError, TypeError):
+        return mqtt.Client(client_id=cid, clean_session=True)
+
+# ==============================================================================
+# GATEWAY DE ACTUADORES PERSISTENTE
 # ==============================================================================
 class IoTActuatorGateway:
     def __init__(self, broker: str = "broker.mqttdashboard.com", port: int = 1883, device_id: str = "esp32_main"):
@@ -68,17 +79,24 @@ class IoTActuatorGateway:
         self.connected = False
         self.history = []
 
-        self._client = mqtt.Client(
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"Client_Actuators_{device_id}"
-        )
-        self._client.on_connect = lambda c, u, f, rc, p=None: setattr(self, 'connected', (rc == 0))
-        self._client.on_disconnect = lambda c, u, f, rc, p=None: setattr(self, 'connected', False)
+        self._client = create_mqtt_client("Streamlit_Actuator")
+        self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
         
         try:
             self._client.connect(self.broker, self.port, keepalive=30)
             self._client.loop_start()
         except Exception:
+            self.connected = False
+
+    def _on_connect(self, client, userdata, flags, *args, **kwargs):
+        rc = args[0] if len(args) > 0 else 0
+        success = (rc == 0) or (getattr(rc, "is_failure", False) is False)
+        with self._lock:
+            self.connected = success
+
+    def _on_disconnect(self, client, userdata, *args, **kwargs):
+        with self._lock:
             self.connected = False
 
     def send_digital(self, state: bool) -> bool:
@@ -103,20 +121,19 @@ def get_actuator_gateway() -> IoTActuatorGateway:
 
 gateway = get_actuator_gateway()
 
-# Estado local del UI
 if 'led_state' not in st.session_state:
     st.session_state.led_state = False
 if 'servo_angle' not in st.session_state:
     st.session_state.servo_angle = 0
 
 st.title("⚡ Control de Actuadores")
-st.caption(f"Dispositivo de destino: `{gateway.device_id}` | Socket persistente")
+st.caption(f"Dispositivo destino: `{gateway.device_id}` | Socket permanente")
 
-# 1. ACTUADOR DIGITAL
+# 1. ACTUADOR DIGITAL (LED / RELÉ)
 with st.container(border=True):
     color_led = "#2dd4bf" if st.session_state.led_state else "#94a3b8"
     str_led = "ACTIVADO [ON]" if st.session_state.led_state else "DESACTIVADO [OFF]"
-    st.markdown(f'<div class="actuator-label">Canal Digital (LED / Relé): <span style="color:{color_led};">{str_led}</span></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="actuator-label">Canal Digital (LED): <span style="color:{color_led};">{str_led}</span></div>', unsafe_allow_html=True)
     
     c_on, c_off = st.columns(2)
     with c_on:
@@ -130,16 +147,15 @@ with st.container(border=True):
                 st.session_state.led_state = False
                 st.rerun()
 
-# 2. ACTUADOR ANALÓGICO
+# 2. ACTUADOR ANALÓGICO (SERVOMOTOR)
 with st.container(border=True):
     st.markdown('<div class="actuator-label">Canal Analógico (Servomotor)</div>', unsafe_allow_html=True)
-    
     val_deg = st.slider("Posición Angular (0° a 180°):", 0, 180, st.session_state.servo_angle, step=5)
     
     if st.button("Transmitir Calibración Angular", use_container_width=True):
         if gateway.send_analog(val_deg):
             st.session_state.servo_angle = val_deg
-            st.success(f"Comando de posición ({val_deg}°) despachado al dispositivo.")
+            st.success(f"Posición de {val_deg}° enviada al dispositivo.")
 
 with st.expander("Registro de Órdenes Despachadas", expanded=False):
     for entry in reversed(gateway.history[-8:]):
